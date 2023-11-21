@@ -1,59 +1,51 @@
 from flask import Flask, request, jsonify
 import cv2
-from keras.models import load_model
 import numpy as np
 from keras.applications import ResNet50
-from keras.optimizers import Adam
-from keras.layers import Dense, Flatten,Input, Convolution2D, Dropout, LSTM, TimeDistributed, Embedding, Bidirectional, Activation, RepeatVector,Concatenate
+from keras.layers import Dense, LSTM, TimeDistributed, Embedding, RepeatVector,Concatenate
 from keras.models import Sequential, Model
-from keras.preprocessing import image, sequence
 import cv2
 from keras.preprocessing.sequence import pad_sequences
-from tqdm import tqdm
 from flask_cors import CORS
 
 from keras.applications import ResNet50
-resnet = ResNet50(include_top=False, weights='imagenet',input_shape=(224,224,3), pooling='avg')
 
-print("="*50)
-print("resnet loaded")
+inception_model = ResNet50(include_top=True)
+last = inception_model.layers[-2].output # Output of the penultimate layer of ResNet model 
+model = Model(inputs=inception_model.input,outputs=last)
 
-vocab = np.load('vocab.npy', allow_pickle=True)               
-
+vocab = np.load('vocab.npy', allow_pickle=True)   
 vocab = vocab.item()
+inverse_dict = {v:k for k,v in vocab.items()}
 
-inv_vocab = {v:k for k,v in vocab.items()}
+embedding_len = 128
+MAX_LEN = 34
+vocab_size = 4031
 
-embedding_size = 128
-max_len = 40                      
-vocab_size = len(vocab)
+# Model for image feature extraction
+img_model = Sequential()
+img_model.add(Dense(embedding_len,input_shape=(2048,),activation='relu'))
+img_model.add(RepeatVector(MAX_LEN))
 
-image_model = Sequential()
+# Model for generating captions from image features
+captions_model = Sequential()
+captions_model.add(Embedding(input_dim=vocab_size+1,output_dim=embedding_len,input_length=MAX_LEN))
+captions_model.add(LSTM(256,return_sequences=True))
+captions_model.add(TimeDistributed(Dense(embedding_len)))
 
-image_model.add(Dense(embedding_size, input_shape=(2048,), activation='relu'))
-image_model.add(RepeatVector(max_len))
+# Concatenating the outputs of image and caption models
+concat_output = Concatenate()([img_model.output,captions_model.output])
+# First LSTM Layer
+output = LSTM(units=128,return_sequences=True)(concat_output)
+# Second LSTM Layer
+output = LSTM(units=512,return_sequences=False)(output)
+# Output Layer 
+output = Dense(units=vocab_size+1,activation='softmax')(output)
+# Creating the final model
+final_model = Model(inputs=[img_model.input,captions_model.input],outputs=output)
+final_model.compile(loss='categorical_crossentropy',optimizer='RMSprop',metrics='accuracy')
 
-
-language_model = Sequential()
-
-language_model.add(Embedding(input_dim=vocab_size, output_dim=embedding_size, input_length=max_len))
-language_model.add(LSTM(256, return_sequences=True))
-language_model.add(TimeDistributed(Dense(embedding_size)))
-
-
-conca = Concatenate()([image_model.output, language_model.output])
-x = LSTM(128, return_sequences=True)(conca)
-x = LSTM(512, return_sequences=False)(x)
-x = Dense(vocab_size)(x)
-out = Activation('softmax')(x)
-model = Model(inputs=[image_model.input, language_model.input], outputs = out)
-
-model.compile(loss='categorical_crossentropy', optimizer='RMSprop', metrics=['accuracy'])
-
-model.load_weights('mine_model_weights.h5')
-
-print("="*50)
-print("model loaded")
+final_model.load_weights('image_caption_generator.h5')
 
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 1
@@ -61,7 +53,7 @@ cors = CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.route('/generate', methods=['POST'])
 def after():
-    global model,vocab,inv_vocab 
+    global final_model,vocab,inverse_dict,model
     file = request.files['file']
 
     file.save('static/file.jpg')
@@ -69,41 +61,32 @@ def after():
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img,(224,224,))                    # diff
     img = np.reshape(img,(1,224,224,3))
-    features = resnet.predict(img).reshape(1,2048)
 
-    print("="*50)
-    print("Predict Features")
-
-
-    text_in = ['startofseq']
-
-    final = ''
-
-    print("="*50)
-    print("GETING Captions")
-
+    test_feature = model.predict(img).reshape(1,2048)
+    pred_text = ['startofseq']
     count = 0
-    while tqdm(count < 20):
-
+    caption = '' # Stores the predicted captions text
+    
+    while count < 25:
         count += 1
-
+        # Encoding the captions text with numbers
         encoded = []
-        for i in text_in:
+        
+        for i in pred_text:
             encoded.append(vocab[i])
-
-        padded = pad_sequences([encoded], maxlen=max_len, padding='post', truncating='post').reshape(1,max_len)
-
-        sampled_index = np.argmax(model.predict([features, padded]))
-
-        sampled_word = inv_vocab[sampled_index]
-
-        if sampled_word != 'endofseq':
-            final = final + ' ' + sampled_word
-
-        text_in.append(sampled_word)
-
-
-    return jsonify({'caption': final})
+        
+        encoded = [encoded]
+        # Padding the encoded text sequences to maximum length
+        encoded = pad_sequences(encoded,maxlen=34,padding='post',truncating='post')
+        pred_idx = np.argmax(final_model.predict([test_feature,encoded])) # Fetching the predicted word index having the maximum probability of occurrence
+        sampled_word = inverse_dict[pred_idx] # Extracting the predicted word by its respective index
+        # Checking for ending of the sequence
+        if sampled_word == 'endofseq':
+            break
+        caption = caption + ' ' + sampled_word
+        pred_text.append(sampled_word)
+ 
+    return jsonify({'caption': caption})
 
 
 if __name__ == "__main__":
